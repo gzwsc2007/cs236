@@ -131,12 +131,7 @@ class ResNetEncoder(nn.Module):
         )
 
         # Output modules
-        self.encode_mean = nn.Sequential(
-            nn.Linear(last_channel_size * DATA_LENGTH_AT_BOTTLENECK, fc_dim),
-            nn.ReLU(True),
-            nn.Dropout(dropout),
-            nn.Linear(fc_dim, latent_dim))
-        self.encode_logvar = nn.Sequential(
+        self.output_layer = nn.Sequential(
             nn.Linear(last_channel_size * DATA_LENGTH_AT_BOTTLENECK, fc_dim),
             nn.ReLU(True),
             nn.Dropout(dropout),
@@ -164,12 +159,6 @@ class ResNetEncoder(nn.Module):
                     nn.init.constant_(m.bn3.weight, 0)
                 elif isinstance(m, BasicBlock1D):
                     nn.init.constant_(m.bn2.weight, 0)
-
-    def _sample_latent(self, mean, logvar):
-        # Reparametrization trick
-        epsilon = torch.randn_like(logvar)
-        sigma = torch.exp(0.5 * logvar)
-        return mean + sigma * epsilon
     
     def forward(self, x):
         x = self.input_block(x)
@@ -178,10 +167,7 @@ class ResNetEncoder(nn.Module):
         shape = x.shape
         x = x.reshape((shape[0], self.last_channel_size * DATA_LENGTH_AT_BOTTLENECK))
         
-        mean = self.encode_mean(x)
-        logvar = self.encode_logvar(x)
-        z = self._sample_latent(mean, logvar)
-        return mean, logvar, z
+        return self.output_layer(x)
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -273,11 +259,11 @@ class Decoder(nn.Module):
         x = self.deconv4(x)
         return self.output_block(x)
 
-class CnnVae(nn.Module):
+class CnnAutoencoder(nn.Module):
     def __init__(self, feature_dim, latent_dim, first_channel_size, last_channel_size,
                  fc_dim):
-        super(CnnVae, self).__init__()
-        self.name = "CnnVae_feat={}_latent={}_firstChan={}_lastChan={}_fcDim={}".format(
+        super(CnnAutoencoder, self).__init__()
+        self.name = "CnnAe_feat={}_latent={}_firstChan={}_lastChan={}_fcDim={}".format(
             feature_dim, latent_dim, first_channel_size, last_channel_size, fc_dim)
         self.latent_dim = latent_dim
         self.enc = ResNetEncoder(feature_dim,
@@ -290,162 +276,10 @@ class CnnVae(nn.Module):
                            first_channel_size,
                            last_channel_size,
                            fc_dim)
-
-        # Set prior as fixed parameter attached to Module
-        self.z_prior_m = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-        self.z_prior_v = torch.nn.Parameter(torch.ones(1), requires_grad=False)
-        self.z_prior = (self.z_prior_m, self.z_prior_v)
-
-    def encode(self, x):
-        mean, _, _ = self.enc(x)
-        return mean
     
     def forward(self, x):
-        mean, logvar, z = self.enc(x)
-        return mean, logvar, self.dec(z)
-
-    def kl_normal(self, qm, qv, pm, pv):
-        """
-        Computes the elem-wise KL divergence between two normal distributions KL(q || p) and
-        sum over the last dimension
-    
-        Args:
-            qm: tensor: (batch, dim): q mean
-            qv: tensor: (batch, dim): q variance
-            pm: tensor: (batch, dim): p mean
-            pv: tensor: (batch, dim): p variance
-    
-        Return:
-            kl: tensor: (batch,): kl between each sample
-        """
-        element_wise = 0.5 * (torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1)
-        kl = element_wise.sum(-1)
-        return kl
-    
-    def negative_elbo_bound(self, x):
-        """
-        Computes the Evidence Lower Bound, KL and, Reconstruction costs
-
-        Args:
-            x: tensor: (batch, dim): Observations
-
-        Returns:
-            nelbo: tensor: (): Negative evidence lower bound
-            kl: tensor: (): ELBO KL divergence to prior
-            rec: tensor: (): ELBO Reconstruction term
-        """
-        ################################################################################
-        # Compute negative Evidence Lower Bound and its KL and Rec decomposition
-        #
-        # Note that nelbo = kl + rec
-        #
-        # Outputs should all be scalar
-        ################################################################################
-        batch = x.shape[0]
-        qm, log_qv, z = self.enc(x)
-        kl = torch.mean(self.kl_normal(qm,
-                                       torch.exp(log_qv),
-                                       self.z_prior_m.expand(batch, self.latent_dim),
-                                       self.z_prior_v.expand(batch, self.latent_dim)))
-
-        x_rec = self.dec(z)
-        
-        rec = torch.nn.functional.mse_loss(x_rec, x, reduction='sum')
-        rec /= batch
-
-        nelbo = kl + rec
-
-        ################################################################################
-        # End of code modification
-        ################################################################################
-        return nelbo, kl, rec
-
-class CnnVaeSemiSup(nn.Module):
-    def __init__(self, feature_dim, latent_dim, first_channel_size, last_channel_size,
-                 fc_dim):
-        super(CnnVaeSemiSup, self).__init__()
-        self.name = "CnnVaeSemiSup_feat={}_latent={}_firstChan={}_lastChan={}_fcDim={}".format(
-            feature_dim, latent_dim, first_channel_size, last_channel_size, fc_dim)
-        self.latent_dim = latent_dim
-        self.enc = ResNetEncoder(feature_dim,
-                                 latent_dim,
-                                 first_channel_size,
-                                 last_channel_size,
-                                 fc_dim)
-        self.dec = Decoder(feature_dim,
-                           latent_dim,
-                           first_channel_size,
-                           last_channel_size,
-                           fc_dim)
-
-        # Set prior as fixed parameter attached to Module
-        self.z_prior_m = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
-        self.z_prior_v = torch.nn.Parameter(torch.ones(1), requires_grad=False)
-        self.z_prior = (self.z_prior_m, self.z_prior_v)
-
-    def encode(self, x):
-        mean, _, _ = self.enc(x)
-        return mean
-    
-    def forward(self, x):
-        mean, logvar, z = self.enc(x)
-        return mean, logvar, self.dec(z)
-
-    def kl_normal(self, qm, qv, pm, pv):
-        """
-        Computes the elem-wise KL divergence between two normal distributions KL(q || p) and
-        sum over the last dimension
-    
-        Args:
-            qm: tensor: (batch, dim): q mean
-            qv: tensor: (batch, dim): q variance
-            pm: tensor: (batch, dim): p mean
-            pv: tensor: (batch, dim): p variance
-    
-        Return:
-            kl: tensor: (batch,): kl between each sample
-        """
-        element_wise = 0.5 * (torch.log(pv) - torch.log(qv) + qv / pv + (qm - pm).pow(2) / pv - 1)
-        kl = element_wise.sum(-1)
-        return kl
-    
-    def negative_elbo_bound(self, x):
-        """
-        Computes the Evidence Lower Bound, KL and, Reconstruction costs
-
-        Args:
-            x: tensor: (batch, dim): Observations
-
-        Returns:
-            nelbo: tensor: (): Negative evidence lower bound
-            kl: tensor: (): ELBO KL divergence to prior
-            rec: tensor: (): ELBO Reconstruction term
-        """
-        ################################################################################
-        # Compute negative Evidence Lower Bound and its KL and Rec decomposition
-        #
-        # Note that nelbo = kl + rec
-        #
-        # Outputs should all be scalar
-        ################################################################################
-        batch = x.shape[0]
-        qm, log_qv, z = self.enc(x)
-        kl = torch.mean(self.kl_normal(qm,
-                                       torch.exp(log_qv),
-                                       self.z_prior_m.expand(batch, self.latent_dim),
-                                       self.z_prior_v.expand(batch, self.latent_dim)))
-
-        x_rec = self.dec(z)
-        
-        rec = torch.nn.functional.mse_loss(x_rec, x, reduction='sum')
-        rec /= batch
-
-        nelbo = kl + rec
-
-        ################################################################################
-        # End of code modification
-        ################################################################################
-        return nelbo, kl, rec
+        z = self.enc(x)
+        return self.dec(z)
 
 class VelocityRegressor(nn.Module):
     def __init__(self, cnn_encoder, fc_dims, num_outputs, dropout=0.25):
@@ -468,6 +302,6 @@ class VelocityRegressor(nn.Module):
         self.velocity_layers = nn.Sequential(*velocity_layers)
 
     def forward(self, x):
-        x, _, _ = self.cnn_encoder(x)
+        x = self.cnn_encoder(x)
         return self.velocity_layers(x)
         
